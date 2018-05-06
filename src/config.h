@@ -224,4 +224,12 @@ void setproctitle(const char *fmt, ...);
 #define USE_ALIGNED_ACCESS
 #endif
 
+struct redisConfig {
+   unsigned long long maxmemory;   /* Max number of memory bytes to use */
+   int maxmemory_policy;     /* Policy for key eviction */
+   size_t initial_memory_usage; /* Bytes used after initialization. */ 
+   int lazyfree_lazy_server_del;
+};
+
+extern struct redisConfig config;
 #endif
