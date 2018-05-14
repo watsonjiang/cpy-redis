@@ -225,10 +225,24 @@ void setproctitle(const char *fmt, ...);
 #endif
 
 struct redisConfig {
-   unsigned long long maxmemory;   /* Max number of memory bytes to use */
-   int maxmemory_policy;     /* Policy for key eviction */
-   size_t initial_memory_usage; /* Bytes used after initialization. */ 
-   int lazyfree_lazy_server_del;
+    unsigned long long maxmemory;   /* Max number of memory bytes to use */
+    int maxmemory_policy;     /* Policy for key eviction */
+    size_t initial_memory_usage; /* Bytes used after initialization. */ 
+    /* Lazy free */
+    int lazyfree_lazy_eviction;
+    int lazyfree_lazy_expire;
+    int lazyfree_lazy_server_del;
+    /* List parameters */
+    int list_max_ziplist_size;
+    int list_compress_depth;
+    /* Zip structure config, see redis.conf for more information  */
+    size_t hash_max_ziplist_entries;
+    size_t hash_max_ziplist_value;
+    size_t set_max_intset_entries;
+    size_t zset_max_ziplist_entries;
+    size_t zset_max_ziplist_value;
+    size_t hll_sparse_max_bytes;
+
 };
 
 extern struct redisConfig config;

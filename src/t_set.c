@@ -66,7 +66,7 @@ int setTypeAdd(robj *subject, sds value) {
             if (success) {
                 /* Convert to regular set when the intset contains
                  * too many entries. */
-                if (intsetLen(subject->ptr) > server.set_max_intset_entries)
+                if (intsetLen(subject->ptr) > config.set_max_intset_entries)
                     setTypeConvert(subject,OBJ_ENCODING_HT);
                 return 1;
             }
@@ -283,7 +283,6 @@ void saddCommand(client *c) {
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[1],c->db->id);
     }
-    server.dirty += added;
     addReplyLongLong(c,added);
 }
 
@@ -310,7 +309,6 @@ void sremCommand(client *c) {
         if (keyremoved)
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],
                                 c->db->id);
-        server.dirty += deleted;
     }
     addReplyLongLong(c,deleted);
 }
@@ -360,11 +358,9 @@ void smoveCommand(client *c) {
 
     signalModifiedKey(c->db,c->argv[1]);
     signalModifiedKey(c->db,c->argv[2]);
-    server.dirty++;
 
     /* An extra key has changed when ele was successfully added to dstset */
     if (setTypeAdd(dstset,ele->ptr)) {
-        server.dirty++;
         notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[2],c->db->id);
     }
     addReply(c,shared.cone);
@@ -429,7 +425,6 @@ void spopWithCountCommand(client *c) {
 
     /* Generate an SPOP keyspace notification */
     notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
-    server.dirty += count;
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
@@ -445,16 +440,12 @@ void spopWithCountCommand(client *c) {
         /* Propagate this command as an DEL operation */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c->db,c->argv[1]);
-        server.dirty++;
         return;
     }
 
     /* Case 2 and 3 require to replicate SPOP as a set of SREM commands.
      * Prepare our replication argument vector. Also send the array length
      * which is common to both the code paths. */
-    robj *propargv[3];
-    propargv[0] = createStringObject("SREM",4);
-    propargv[1] = c->argv[1];
     addReplyMultiBulkLen(c,count);
 
     /* Common iteration vars. */
@@ -485,10 +476,6 @@ void spopWithCountCommand(client *c) {
                 setTypeRemove(set,sdsele);
             }
 
-            /* Replicate/AOF this command as an SREM operation */
-            propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
             decrRefCount(objele);
         }
     } else {
@@ -532,10 +519,6 @@ void spopWithCountCommand(client *c) {
                 objele = createStringObject(sdsele,sdslen(sdsele));
             }
 
-            /* Replicate/AOF this command as an SREM operation */
-            propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
             decrRefCount(objele);
         }
         setTypeReleaseIterator(si);
@@ -546,10 +529,7 @@ void spopWithCountCommand(client *c) {
      * dirty counter. We don't want to propagate an SPOP command since
      * we propagated the command as a set of SREMs operations using
      * the alsoPropagate() API. */
-    decrRefCount(propargv[0]);
-    preventCommandPropagation(c);
     signalModifiedKey(c->db,c->argv[1]);
-    server.dirty++;
 }
 
 void spopCommand(client *c) {
@@ -602,7 +582,6 @@ void spopCommand(client *c) {
 
     /* Set has been modified */
     signalModifiedKey(c->db,c->argv[1]);
-    server.dirty++;
 }
 
 /* handle the "SRANDMEMBER key <count>" variant. The normal version of the
@@ -811,7 +790,6 @@ void sinterGenericCommand(client *c, robj **setkeys,
             if (dstkey) {
                 if (dbDelete(c->db,dstkey)) {
                     signalModifiedKey(c->db,dstkey);
-                    server.dirty++;
                 }
                 addReply(c,shared.czero);
             } else {
@@ -911,7 +889,6 @@ void sinterGenericCommand(client *c, robj **setkeys,
                     dstkey,c->db->id);
         }
         signalModifiedKey(c->db,dstkey);
-        server.dirty++;
     } else {
         setDeferredMultiBulkLength(c,replylen,cardinality);
     }
@@ -1085,7 +1062,6 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                     dstkey,c->db->id);
         }
         signalModifiedKey(c->db,dstkey);
-        server.dirty++;
     }
     zfree(sets);
 }

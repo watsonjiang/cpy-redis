@@ -1190,8 +1190,8 @@ void zsetConvertToZiplistIfNeeded(robj *zobj, size_t maxelelen) {
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) return;
     zset *zset = zobj->ptr;
 
-    if (zset->zsl->length <= server.zset_max_ziplist_entries &&
-        maxelelen <= server.zset_max_ziplist_value)
+    if (zset->zsl->length <= config.zset_max_ziplist_entries &&
+        maxelelen <= config.zset_max_ziplist_value)
             zsetConvert(zobj,OBJ_ENCODING_ZIPLIST);
 }
 
@@ -1304,9 +1304,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             /* Optimize: check if the element is too large or the list
              * becomes too long *before* executing zzlInsert. */
             zobj->ptr = zzlInsert(zobj->ptr,ele,score);
-            if (zzlLength(zobj->ptr) > server.zset_max_ziplist_entries)
+            if (zzlLength(zobj->ptr) > config.zset_max_ziplist_entries)
                 zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
-            if (sdslen(ele) > server.zset_max_ziplist_value)
+            if (sdslen(ele) > config.zset_max_ziplist_value)
                 zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
             if (newscore) *newscore = score;
             *flags |= ZADD_ADDED;
@@ -1553,8 +1553,8 @@ void zaddGenericCommand(client *c, int flags) {
     zobj = lookupKeyWrite(c->db,key);
     if (zobj == NULL) {
         if (xx) goto reply_to_client; /* No key + XX option: nothing to do. */
-        if (server.zset_max_ziplist_entries == 0 ||
-            server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
+        if (config.zset_max_ziplist_entries == 0 ||
+            config.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
         {
             zobj = createZsetObject();
         } else {
@@ -1584,7 +1584,6 @@ void zaddGenericCommand(client *c, int flags) {
         if (!(retflags & ZADD_NOP)) processed++;
         score = newscore;
     }
-    server.dirty += (added+updated);
 
 reply_to_client:
     if (incr) { /* ZINCRBY or INCR option. */
@@ -1635,7 +1634,6 @@ void zremCommand(client *c) {
         if (keyremoved)
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
         signalModifiedKey(c->db,key);
-        server.dirty += deleted;
     }
     addReplyLongLong(c,deleted);
 }
@@ -1737,7 +1735,6 @@ void zremrangeGenericCommand(client *c, int rangetype) {
         if (keyremoved)
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
     }
-    server.dirty += deleted;
     addReplyLongLong(c,deleted);
 
 cleanup:
@@ -2336,14 +2333,12 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
         notifyKeyspaceEvent(NOTIFY_ZSET,
             (op == SET_OP_UNION) ? "zunionstore" : "zinterstore",
             dstkey,c->db->id);
-        server.dirty++;
     } else {
         decrRefCount(dstobj);
         addReply(c,shared.czero);
         if (touched) {
             signalModifiedKey(c->db,dstkey);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
-            server.dirty++;
         }
     }
     zfree(src);

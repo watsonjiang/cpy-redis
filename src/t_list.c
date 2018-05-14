@@ -181,8 +181,8 @@ void listTypeConvert(robj *subject, int enc) {
     serverAssertWithInfo(NULL,subject,subject->encoding==OBJ_ENCODING_ZIPLIST);
 
     if (enc == OBJ_ENCODING_QUICKLIST) {
-        size_t zlen = server.list_max_ziplist_size;
-        int depth = server.list_compress_depth;
+        size_t zlen = config.list_max_ziplist_size;
+        int depth = config.list_compress_depth;
         subject->ptr = quicklistCreateFromZiplist(zlen, depth, subject->ptr);
         subject->encoding = OBJ_ENCODING_QUICKLIST;
     } else {
@@ -206,8 +206,8 @@ void pushGenericCommand(client *c, int where) {
     for (j = 2; j < c->argc; j++) {
         if (!lobj) {
             lobj = createQuicklistObject();
-            quicklistSetOptions(lobj->ptr, server.list_max_ziplist_size,
-                                server.list_compress_depth);
+            quicklistSetOptions(lobj->ptr, config.list_max_ziplist_size,
+                                config.list_compress_depth);
             dbAdd(c->db,c->argv[1],lobj);
         }
         listTypePush(lobj,c->argv[j],where);
@@ -220,7 +220,6 @@ void pushGenericCommand(client *c, int where) {
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
     }
-    server.dirty += pushed;
 }
 
 void lpushCommand(client *c) {
@@ -250,7 +249,6 @@ void pushxGenericCommand(client *c, int where) {
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST,event,c->argv[1],c->db->id);
     }
-    server.dirty += pushed;
 }
 
 void lpushxCommand(client *c) {
@@ -295,7 +293,6 @@ void linsertCommand(client *c) {
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST,"linsert",
                             c->argv[1],c->db->id);
-        server.dirty++;
     } else {
         /* Notify client of a failed insert */
         addReply(c,shared.cnegone);
@@ -357,7 +354,6 @@ void lsetCommand(client *c) {
             addReply(c,shared.ok);
             signalModifiedKey(c->db,c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_LIST,"lset",c->argv[1],c->db->id);
-            server.dirty++;
         }
     } else {
         serverPanic("Unknown list encoding");
@@ -383,7 +379,6 @@ void popGenericCommand(client *c, int where) {
             dbDelete(c->db,c->argv[1]);
         }
         signalModifiedKey(c->db,c->argv[1]);
-        server.dirty++;
     }
 }
 
@@ -483,7 +478,6 @@ void ltrimCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_GENERIC,"del",c->argv[1],c->db->id);
     }
     signalModifiedKey(c->db,c->argv[1]);
-    server.dirty++;
     addReply(c,shared.ok);
 }
 
@@ -511,7 +505,6 @@ void lremCommand(client *c) {
     while (listTypeNext(li,&entry)) {
         if (listTypeEqual(&entry,obj)) {
             listTypeDelete(li, &entry);
-            server.dirty++;
             removed++;
             if (toremove && removed == toremove) break;
         }
@@ -551,8 +544,8 @@ void rpoplpushHandlePush(client *c, robj *dstkey, robj *dstobj, robj *value) {
     /* Create the list if the key does not exist */
     if (!dstobj) {
         dstobj = createQuicklistObject();
-        quicklistSetOptions(dstobj->ptr, server.list_max_ziplist_size,
-                            server.list_compress_depth);
+        quicklistSetOptions(dstobj->ptr, config.list_max_ziplist_size,
+                            config.list_compress_depth);
         dbAdd(c->db,dstkey,dstobj);
     }
     signalModifiedKey(c->db,dstkey);
@@ -595,7 +588,6 @@ void rpoplpushCommand(client *c) {
         }
         signalModifiedKey(c->db,touchedkey);
         decrRefCount(touchedkey);
-        server.dirty++;
     }
 }
 
@@ -686,286 +678,3 @@ void unblockClientWaitingData(client *c) {
     }
 }
 
-/* If the specified key has clients blocked waiting for list pushes, this
- * function will put the key reference into the server.ready_keys list.
- * Note that db->ready_keys is a hash table that allows us to avoid putting
- * the same key again and again in the list in case of multiple pushes
- * made by a script or in the context of MULTI/EXEC.
- *
- * The list will be finally processed by handleClientsBlockedOnLists() */
-void signalListAsReady(redisDb *db, robj *key) {
-    readyList *rl;
-
-    /* No clients blocking for this key? No need to queue it. */
-    if (dictFind(db->blocking_keys,key) == NULL) return;
-
-    /* Key was already signaled? No need to queue it again. */
-    if (dictFind(db->ready_keys,key) != NULL) return;
-
-    /* Ok, we need to queue this key into server.ready_keys. */
-    rl = zmalloc(sizeof(*rl));
-    rl->key = key;
-    rl->db = db;
-    incrRefCount(key);
-    listAddNodeTail(server.ready_keys,rl);
-
-    /* We also add the key in the db->ready_keys dictionary in order
-     * to avoid adding it multiple times into a list with a simple O(1)
-     * check. */
-    incrRefCount(key);
-    serverAssert(dictAdd(db->ready_keys,key,NULL) == DICT_OK);
-}
-
-/* This is a helper function for handleClientsBlockedOnLists(). It's work
- * is to serve a specific client (receiver) that is blocked on 'key'
- * in the context of the specified 'db', doing the following:
- *
- * 1) Provide the client with the 'value' element.
- * 2) If the dstkey is not NULL (we are serving a BRPOPLPUSH) also push the
- *    'value' element on the destination list (the LPUSH side of the command).
- * 3) Propagate the resulting BRPOP, BLPOP and additional LPUSH if any into
- *    the AOF and replication channel.
- *
- * The argument 'where' is LIST_TAIL or LIST_HEAD, and indicates if the
- * 'value' element was popped fron the head (BLPOP) or tail (BRPOP) so that
- * we can propagate the command properly.
- *
- * The function returns C_OK if we are able to serve the client, otherwise
- * C_ERR is returned to signal the caller that the list POP operation
- * should be undone as the client was not served: This only happens for
- * BRPOPLPUSH that fails to push the value to the destination key as it is
- * of the wrong type. */
-int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int where)
-{
-    robj *argv[3];
-
-    if (dstkey == NULL) {
-        /* Propagate the [LR]POP operation. */
-        argv[0] = (where == LIST_HEAD) ? shared.lpop :
-                                          shared.rpop;
-        argv[1] = key;
-        propagate((where == LIST_HEAD) ?
-            server.lpopCommand : server.rpopCommand,
-            db->id,argv,2,PROPAGATE_AOF|PROPAGATE_REPL);
-
-        /* BRPOP/BLPOP */
-        addReplyMultiBulkLen(receiver,2);
-        addReplyBulk(receiver,key);
-        addReplyBulk(receiver,value);
-    } else {
-        /* BRPOPLPUSH */
-        robj *dstobj =
-            lookupKeyWrite(receiver->db,dstkey);
-        if (!(dstobj &&
-             checkType(receiver,dstobj,OBJ_LIST)))
-        {
-            /* Propagate the RPOP operation. */
-            argv[0] = shared.rpop;
-            argv[1] = key;
-            propagate(server.rpopCommand,
-                db->id,argv,2,
-                PROPAGATE_AOF|
-                PROPAGATE_REPL);
-            rpoplpushHandlePush(receiver,dstkey,dstobj,
-                value);
-            /* Propagate the LPUSH operation. */
-            argv[0] = shared.lpush;
-            argv[1] = dstkey;
-            argv[2] = value;
-            propagate(server.lpushCommand,
-                db->id,argv,3,
-                PROPAGATE_AOF|
-                PROPAGATE_REPL);
-        } else {
-            /* BRPOPLPUSH failed because of wrong
-             * destination type. */
-            return C_ERR;
-        }
-    }
-    return C_OK;
-}
-
-/* This function should be called by Redis every time a single command,
- * a MULTI/EXEC block, or a Lua script, terminated its execution after
- * being called by a client.
- *
- * All the keys with at least one client blocked that received at least
- * one new element via some PUSH operation are accumulated into
- * the server.ready_keys list. This function will run the list and will
- * serve clients accordingly. Note that the function will iterate again and
- * again as a result of serving BRPOPLPUSH we can have new blocking clients
- * to serve because of the PUSH side of BRPOPLPUSH. */
-void handleClientsBlockedOnLists(void) {
-    while(listLength(server.ready_keys) != 0) {
-        list *l;
-
-        /* Point server.ready_keys to a fresh list and save the current one
-         * locally. This way as we run the old list we are free to call
-         * signalListAsReady() that may push new elements in server.ready_keys
-         * when handling clients blocked into BRPOPLPUSH. */
-        l = server.ready_keys;
-        server.ready_keys = listCreate();
-
-        while(listLength(l) != 0) {
-            listNode *ln = listFirst(l);
-            readyList *rl = ln->value;
-
-            /* First of all remove this key from db->ready_keys so that
-             * we can safely call signalListAsReady() against this key. */
-            dictDelete(rl->db->ready_keys,rl->key);
-
-            /* If the key exists and it's a list, serve blocked clients
-             * with data. */
-            robj *o = lookupKeyWrite(rl->db,rl->key);
-            if (o != NULL && o->type == OBJ_LIST) {
-                dictEntry *de;
-
-                /* We serve clients in the same order they blocked for
-                 * this key, from the first blocked to the last. */
-                de = dictFind(rl->db->blocking_keys,rl->key);
-                if (de) {
-                    list *clients = dictGetVal(de);
-                    int numclients = listLength(clients);
-
-                    while(numclients--) {
-                        listNode *clientnode = listFirst(clients);
-                        client *receiver = clientnode->value;
-                        robj *dstkey = receiver->bpop.target;
-                        int where = (receiver->lastcmd &&
-                                     receiver->lastcmd->proc == blpopCommand) ?
-                                    LIST_HEAD : LIST_TAIL;
-                        robj *value = listTypePop(o,where);
-
-                        if (value) {
-                            /* Protect receiver->bpop.target, that will be
-                             * freed by the next unblockClient()
-                             * call. */
-                            if (dstkey) incrRefCount(dstkey);
-                            unblockClient(receiver);
-
-                            if (serveClientBlockedOnList(receiver,
-                                rl->key,dstkey,rl->db,value,
-                                where) == C_ERR)
-                            {
-                                /* If we failed serving the client we need
-                                 * to also undo the POP operation. */
-                                    listTypePush(o,value,where);
-                            }
-
-                            if (dstkey) decrRefCount(dstkey);
-                            decrRefCount(value);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                if (listTypeLength(o) == 0) {
-                    dbDelete(rl->db,rl->key);
-                }
-                /* We don't call signalModifiedKey() as it was already called
-                 * when an element was pushed on the list. */
-            }
-
-            /* Free this item. */
-            decrRefCount(rl->key);
-            zfree(rl);
-            listDelNode(l,ln);
-        }
-        listRelease(l); /* We have the new list on place at this point. */
-    }
-}
-
-/* Blocking RPOP/LPOP */
-void blockingPopGenericCommand(client *c, int where) {
-    robj *o;
-    mstime_t timeout;
-    int j;
-
-    if (getTimeoutFromObjectOrReply(c,c->argv[c->argc-1],&timeout,UNIT_SECONDS)
-        != C_OK) return;
-
-    for (j = 1; j < c->argc-1; j++) {
-        o = lookupKeyWrite(c->db,c->argv[j]);
-        if (o != NULL) {
-            if (o->type != OBJ_LIST) {
-                addReply(c,shared.wrongtypeerr);
-                return;
-            } else {
-                if (listTypeLength(o) != 0) {
-                    /* Non empty list, this is like a non normal [LR]POP. */
-                    char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
-                    robj *value = listTypePop(o,where);
-                    serverAssert(value != NULL);
-
-                    addReplyMultiBulkLen(c,2);
-                    addReplyBulk(c,c->argv[j]);
-                    addReplyBulk(c,value);
-                    decrRefCount(value);
-                    notifyKeyspaceEvent(NOTIFY_LIST,event,
-                                        c->argv[j],c->db->id);
-                    if (listTypeLength(o) == 0) {
-                        dbDelete(c->db,c->argv[j]);
-                        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
-                                            c->argv[j],c->db->id);
-                    }
-                    signalModifiedKey(c->db,c->argv[j]);
-                    server.dirty++;
-
-                    /* Replicate it as an [LR]POP instead of B[LR]POP. */
-                    rewriteClientCommandVector(c,2,
-                        (where == LIST_HEAD) ? shared.lpop : shared.rpop,
-                        c->argv[j]);
-                    return;
-                }
-            }
-        }
-    }
-
-    /* If we are inside a MULTI/EXEC and the list is empty the only thing
-     * we can do is treating it as a timeout (even with timeout 0). */
-    if (c->flags & CLIENT_MULTI) {
-        addReply(c,shared.nullmultibulk);
-        return;
-    }
-
-    /* If the list is empty or the key does not exists we must block */
-    blockForKeys(c, c->argv + 1, c->argc - 2, timeout, NULL);
-}
-
-void blpopCommand(client *c) {
-    blockingPopGenericCommand(c,LIST_HEAD);
-}
-
-void brpopCommand(client *c) {
-    blockingPopGenericCommand(c,LIST_TAIL);
-}
-
-void brpoplpushCommand(client *c) {
-    mstime_t timeout;
-
-    if (getTimeoutFromObjectOrReply(c,c->argv[3],&timeout,UNIT_SECONDS)
-        != C_OK) return;
-
-    robj *key = lookupKeyWrite(c->db, c->argv[1]);
-
-    if (key == NULL) {
-        if (c->flags & CLIENT_MULTI) {
-            /* Blocking against an empty list in a multi state
-             * returns immediately. */
-            addReply(c, shared.nullbulk);
-        } else {
-            /* The list is empty and the client blocks. */
-            blockForKeys(c, c->argv + 1, 1, timeout, c->argv[2]);
-        }
-    } else {
-        if (key->type != OBJ_LIST) {
-            addReply(c, shared.wrongtypeerr);
-        } else {
-            /* The list exists and has elements, so
-             * the regular rpoplpushCommand is executed. */
-            serverAssertWithInfo(c,key,listTypeLength(key) > 0);
-            rpoplpushCommand(c);
-        }
-    }
-}
